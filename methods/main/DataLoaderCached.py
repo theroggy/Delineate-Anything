@@ -10,6 +10,7 @@ class DataLoaderCached:
         self.nodata_value = config["nodata_value"]
         self.min = config["min"]
         self.max = config["max"]
+        self.normalize_local = bool(config.get("normalize_local", False))
 
         self.lclu_range = lclu_config["range"]
         self.lclu_clip_values = lclu_config["clip_classes"]
@@ -161,7 +162,14 @@ class DataLoaderCached:
             ds_band = ds.GetRasterBand(self.bands[i])
             value = ds_band.ReadAsArray(max(0, begin_offset[0]), max(0, begin_offset[1]), x_end - x_begin, y_end - y_begin)
 
-            self.image_cache[y_begin:y_end, x_begin:x_end, i] = np.clip(255 * ((value - self.min[i]) / (self.max[i] - self.min[i])), 0, 255).astype("uint8")
+            if self.normalize_local:
+                self.image_cache[y_begin:y_end, x_begin:x_end, i] = self._normalize_part(
+                    value, percentiles=[1, 99], nodata_value=self.nodata_value[i]
+                )
+            else:
+                self.image_cache[y_begin:y_end, x_begin:x_end, i] = self._normalize_part(
+                    value, lower=self.min[i], upper=self.max[i]
+                )
             if self.nodata_band is None:
                 self.image_cache[y_begin:y_end, x_begin:x_end, -2] &= (value == self.nodata_value[i])
 
@@ -218,3 +226,34 @@ class DataLoaderCached:
 
             self.image_cache[y_begin:y_end, x_begin:x_end, -2] &= clip_map[lclu]
             self.image_cache[y_begin:y_end, x_begin:x_end, -1] &= filter_map[lclu]
+
+    @staticmethod
+    def _normalize_part(value, *, lower=None, upper=None, percentiles=None, nodata_value=None):
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.size == 0:
+            return np.zeros_like(arr, dtype=np.uint8)
+
+        if percentiles is not None:
+            if lower is not None and upper is not None:
+                raise ValueError("Cannot specify both percentiles and explicit lower/upper bounds.")
+
+            valid_mask = np.isfinite(arr)
+            if nodata_value is not None:
+                valid_mask &= arr != nodata_value
+            valid = arr[valid_mask]
+            if valid.size == 0:
+                return np.zeros_like(arr, dtype=np.uint8)
+            lower, upper = np.percentile(valid, percentiles)
+            lower = float(lower)
+            upper = float(upper)
+
+        if lower is None or upper is None:
+            return np.zeros_like(arr, dtype=np.uint8)
+
+        lower = float(lower)
+        upper = float(upper)
+        if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+            return np.zeros_like(arr, dtype=np.uint8)
+
+        normalized = np.clip((arr - lower) / (upper - lower), 0.0, 1.0)
+        return (normalized * 255.0).astype(np.uint8)

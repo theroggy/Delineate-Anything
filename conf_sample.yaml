@@ -29,6 +29,7 @@ data_loader:
   bands: [3, 2, 1]        # Bands to use from the image (GDAL index, 1-based). For RGB use [3,2,1]
   nodata_band: null       # Optional nodata band (GDAL index)
   nodata_value: [0, 0, 0] # Pixel value considered as nodata. Use [0, 0, 0] for black or null for none
+  normalize_local: false  # if true, normalize each read image part using its own 1/99 percentile instead of the whole-image min/max
   min: null               # Min value for normalization. null - for automatic estimation, [R, G, B] - for manual assignment
   max: null               # Max value for normalization. null - for automatic estimation, [R, G, B] - for manual assignment
 

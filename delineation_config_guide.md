@@ -31,7 +31,12 @@ These parameters must be properly set for accurate results.
 - **`nodata_band`** – If one band uniquely represents nodata, specify it here to improve speed.  
   Otherwise, set to `null`.
 - **`nodata_value`** – Use `[nodata_r, nodata_g, nodata_b]` when `nodata_band = null`.  
-  Otherwise, specify a single scalar value (not an array).
+  Otherwise, specify a single scalar value (not an array). Configured values are
+  excluded from normalization as well as from inference tiles.
+- **`normalize_local`** – Set to `false` to keep the whole-image `min`/`max`
+  normalization, or `true` to normalize each read image part by its own 1st and 99th
+  percentile. This is useful for high-dynamic-range or 16-bit imagery where a single
+  global stretch can flatten local contrast.
 
 ## RAM-Dependent Parameters
 
