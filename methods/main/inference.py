@@ -12,6 +12,7 @@ from . import PostprocHandler as PostprocHandlerLib
 from .PostprocHandler import PostprocHandler
 from .PolygonizationWorker import PolygonizationWorker
 from .BackgroundLoader import BackgroundLoader
+from .giant_filter import filter_giants
 
 from simplification import simplify
 
@@ -60,6 +61,7 @@ def execute(model_paths, config, verbose):
     create_output_folder(os.path.dirname(output_path))
 
     tiffs = [os.path.join(src_folder, file) for file in sorted(os.listdir(src_folder)) if (file.endswith(".tif") or file.endswith(".tiff"))]
+    src_tiffs = list(tiffs)  # original inputs: the VRT below lives in temp_folder, which is deleted before the giant filter if keep_temp is false
     if config["treat_as_vrt"]:
         vrt_path = os.path.join(temp_folder, os.path.basename(src_folder) + ".vrt")
         gdal.BuildVRT(vrt_path, tiffs)
@@ -178,12 +180,12 @@ def execute(model_paths, config, verbose):
 
     time_delineate_start = time.time()
     logger.info("Starting delineation...")
-    execute_delineation(models, planner, config["postprocess_limits"], config["passes"], config["data_loader"], 
-                        (gpkg_path, layer_name), lclu_mask_path, config["mask_info"], config, device)
+    region_seam_pairs = execute_delineation(models, planner, config["postprocess_limits"], config["passes"], config["data_loader"],
+                                            (gpkg_path, layer_name), lclu_mask_path, config["mask_info"], config, device)
     
     logger.info(f"All regions have been delineated in {time.time() - time_delineate_start:.2f} seconds.")
 
-    postdelineation_merge((gpkg_path, layer_name), config["filtering_args"])
+    postdelineation_merge((gpkg_path, layer_name), config["filtering_args"], region_seam_pairs)
 
     if not keep_temp:
         folder_content = os.listdir(temp_folder)
@@ -203,6 +205,23 @@ def execute(model_paths, config, verbose):
         logger.info("Simplification started")
         execute_simplification(gpkg_path, layer_name, config["simplification_args"], analyser.scale)
         logger.info(f"Simplification finished in {time.time() - start:.2f} seconds")
+
+    giant_config = config.get("giant_filter", {})
+    if giant_config.get("enabled", True):
+        start = time.time()
+        final_path = gpkg_path.replace(".gpkg", ".simp.gpkg") if config["simplification_args"]["simplify"] == True else gpkg_path
+        image_path = final_path.replace(".gpkg", ".giant_filter.vrt")  # a file: rasterio does not see GDAL /vsimem
+        gdal.BuildVRT(image_path, src_tiffs)
+        bands = giant_config.get("image_bands") or config["data_loader"]["bands"]
+        pixel_m = analyser.get_pixel_size_meters(src_tiffs[0])
+        if pixel_m < 1:
+            logger.info("Giant filter skipped: it is made for 2.5-10 m imagery and is not applied below 1 m.")
+        else:
+            # inference tile: 512 model px, i.e. 512 / scale image px
+            tile_m = 512 * analyser.pixel_size_x / analyser.scale
+            filter_giants(final_path, layer_name, tile_m, image_path, bands)
+        os.remove(image_path)
+        logger.info(f"Giant filter finished in {time.time() - start:.2f} seconds")
 
 def normalize_nodata_config(loader_config):
     # nodata_band set   -> nodata_value is a single scalar compared against that band
@@ -359,11 +378,29 @@ def execute_delineation(models, planner, postproc_config, passes, dataloader_con
             
             pbar_delineate.refresh()
 
+    region_seam_pairs = postproc_handler.get_region_seam_pairs()
     postproc_handler.dispose()
     logger.debug(f"Total time on creating dataloader: {total_dataloader_time} s.")
 
-def postdelineation_merge(layer_info, filter_config):
+    return region_seam_pairs
+
+def postdelineation_merge(layer_info, filter_config, region_seam_pairs=None):
     gpkg_path, layer_name = layer_info
+
+    # pieces of one field split by a region border carry different ids (see PostprocHandler.__merge_region_seams);
+    # all of them touch the region border (negative id), so they are merged below like the pieces sharing an id
+    region_root = {}
+    def find(i):
+        root = i
+        while region_root.get(root, root) != root:
+            root = region_root[root]
+        while i != root:
+            region_root[i], i = root, region_root[i]
+        return root
+    for a, b in (region_seam_pairs or []):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            region_root[max(ra, rb)] = min(ra, rb)
     gpkg = ogr.Open(gpkg_path, 1)
     layer = gpkg.GetLayerByName(layer_name)
 
@@ -399,6 +436,9 @@ def postdelineation_merge(layer_info, filter_config):
                 continue
 
             orig_geom = feature.GetGeometryRef().Clone()
+
+            if bg == 0 and -id in region_root:
+                id = -find(-id)
 
             if (id, bg) in field_parts:
                 field_parts[(id, bg)].append(orig_geom)
@@ -521,4 +561,4 @@ def warp_lclu(src, dst, sample_tiff, total_bounds, pixel_size, warp_options):
         warped.SetMetadataItem("DA_SOURCE_KEY", source_key)
         warped = None
 
-    return temp_lclu_tiff_path
+    return temp_lclu_tiff_path

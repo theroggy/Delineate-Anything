@@ -95,3 +95,29 @@ countries), but more straight cuts stay.
 Raising the thresholds joins fewer pieces; lowering them removes more cuts but may join neighbouring fields that
 happen to meet exactly on a tile border (for example, parallel strip fields). Set `merge_tile_seams: false` to disable.
 Requires `tile_step: 0.5` (the default).
+
+## Region seams (`passes[].delineation_config`)
+
+Large images are processed in regions of `execution_planner.region_width` x `region_height` px (after
+super-resolution), and each region is post-processed and polygonized separately. A field crossing a region border is
+joined across it only if both regions gave it the same id. Otherwise it is cut by a straight line every `region_width`
+px (about 123 km for Sentinel-2 with the automatic region size).
+With `merge_region_seams: true` (the default), each region keeps a few px of ids, of the centred tile's view and of
+the image along its right and bottom borders (about 2.5 MB per 24576 px of border). The neighbouring region runs the
+tile-seam test above on the border, with the same `seam_*` parameters. The tile centred on the border lies in both
+regions, so the test has the same evidence as inside a region. Pieces whose ids the model's own merges joined after
+the first region was written are joined too. All joins are applied in the output layer once every region is written,
+before simplification, so both the `.gpkg` and the `.simp.gpkg` get them.
+The region size must be a multiple of the tile step (256 px after super-resolution for Sentinel-2; the automatic size
+always is). Otherwise the centred tile is not the same on both sides of the border and fewer pieces are joined.
+Set `merge_region_seams: false` to disable.
+
+## Giant filter (`giant_filter`)
+
+Over low-contrast land (pasture, scrub, hills, blocks of small fields) neighbouring tiles can chain fields into one
+huge polygon, often with straight tile-edge segments. With `enabled: true` (the default) such polygons are removed
+from the final layer. A polygon is removed if it spans at least 4 tiles and is several times larger than the fields
+around it (25 km cells, ignoring other suspects), and it also has straight tile-edge segments, holes left by fields
+inside it, or many field edges inside it on the image. All thresholds are relative to the local field sizes, so real
+large fields are kept. Made for 2.5-10 m imagery (skipped below 1 m); on 2.5 m input over very large fields (for
+example Ukraine) it may also remove some real fields. Requires a projected CRS. Set `enabled: false` to disable.

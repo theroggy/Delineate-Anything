@@ -2,19 +2,6 @@
 
 """Process graph: Delineate-Anything field boundary detection via PyTorch on openEO.
 
-Mirrors the TESSERA-v2 openEO example (torch-in-UDF pattern):
-
-    BAP composite (RGB, [0,1])
-        │
-        └─► apply_neighborhood(size=512x512)
-              └─► UDF: torch + ultralytics YOLO.predict(retina_masks=True)
-                    └─► instance label map (uint16 IDs in a float32 band)
-
-Compared to ``delineate_onnx.py``:
-  * Uses PyTorch + Ultralytics inside the UDF (via ``udf-dependency-archives``)
-    instead of raw ONNX runtime + hand-rolled YOLO decoding.
-  * The UDF returns a clean instance label map, not a soft heatmap, so no
-    fragile ``mask > 0.2`` step is needed downstream.
 
 Example
 -------
@@ -36,8 +23,8 @@ Example
         temporal_extent=["2024-04-01", "2024-09-30"],
     )
     cube.execute_batch(
-        outputfile="delineate_fields.tif",
-        out_format="GTiff",
+        outputfile="delineate_fields.geojson",
+        out_format="GeoJSON",
         job_options=DEFAULT_JOB_OPTIONS,
     )
 """
@@ -47,15 +34,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-import matplotlib.pyplot as plt
-import numpy as np
 import openeo
-import rasterio
-
-try:
-    from rasterio.merge import merge as merge_rasters
-except ImportError:  # pragma: no cover
-    merge_rasters = None
 
 
 
@@ -96,14 +75,17 @@ CHUNK_OVERLAP_PX = 64
 
 # Detection / post-processing defaults (validated locally on BAP_input.nc).
 CONFIDENCE_THRESHOLD = 0.15
-IOU_THRESHOLD = 0.3
+IOU_THRESHOLD = 0.7  # ultralytics default, matches the reference pipeline
 MORPHOLOGY = False
 
-from pathlib import Path
-UDF_PATH = Path('C:\\Git_projects\\Delineate-Anything\\openeo_udp\\udf\\delineate_onnx.py')
+UDF_PATH = Path(__file__).resolve().parents[1] / "udf" / "delineate_onnx.py"
+SORT_UDF_PATH = UDF_PATH.with_name("sort_fields.py")
 
 # S2 bands for RGB (true colour: B04, B03, B02).
 S2_RGB_BANDS = ["B04", "B03", "B02"]
+
+
+
 
 #%%
 # ---------------------------------------------------------------------------
@@ -186,9 +168,8 @@ def build_delineate_onnx(
 
     Returns
     -------
-    openeo.DataCube with 1 band (``instances``): float32 integer instance IDs
-    (0 = background).  Downstream ops can polygonize, filter by area, or
-    re-label across tile boundaries.
+    Vector cube, one polygon per field: ``band0`` (chunk-coded ID) and
+    ``field_id`` (1..N, north->south, west->east), chunk-seam splits merged.
     """
     if bap_cube is not None:
         composite = bap_cube
@@ -205,6 +186,7 @@ def build_delineate_onnx(
         "confidence_threshold": confidence_threshold,
         "iou_threshold": iou_threshold,
         "morphology": morphology,
+        "chunk_core_px": CHUNK_INNER_PX,
     }
     context = processing_options if processing_options is not None else default_context
 
@@ -219,157 +201,36 @@ def build_delineate_onnx(
             {"dimension": "y", "value": CHUNK_OVERLAP_PX, "unit": "px"},
         ],
     )
-    return detected
 
+    
+    # Background (0) -> nodata so only fields are polygonised.
+    fields = detected.mask(detected == 0).raster_to_vector()
+    # Second UDF: merge polygons split by chunk seams, add field_id 1..N.
+    sort_udf = openeo.UDF(SORT_UDF_PATH.read_text(encoding="utf-8"), runtime="Python")
+    return fields.apply_dimension(process=sort_udf, dimension="geometry")
 
-def _load_instance_raster(path: Path | str) -> np.ndarray:
-    """Read a GeoTIFF result into a 2D label map."""
-    with rasterio.open(path) as src:
-        arr = src.read()
-
-    if arr.size == 0:
-        return np.zeros((0, 0), dtype=np.int32)
-
-    if arr.ndim == 3:
-        arr = arr[0] if arr.shape[0] == 1 else arr.transpose(1, 2, 0)
-    arr = np.asarray(arr)
-
-    if arr.ndim == 3:
-        arr = arr[:, :, 0]
-
-    if np.issubdtype(arr.dtype, np.floating):
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return arr.astype(np.int32, copy=False)
-
-
-def _recombine_chunked_instances(label_map: np.ndarray) -> np.ndarray:
-    """Merge chunk-local instance IDs into a single connected-component map.
-
-    The UDF is run on overlapping tiles, so the same field can appear with
-    different local IDs on adjacent chunks.  We collapse the foreground mask into
-    connected components, which gives one consistent instance ID across chunk
-    seams when the pixels are spatially connected.
-    """
-    fg = label_map > 0
-    if not fg.any():
-        return np.zeros_like(label_map, dtype=np.int32)
-
-    h, w = fg.shape
-    visited = np.zeros_like(fg, dtype=bool)
-    merged = np.zeros_like(label_map, dtype=np.int32)
-    current_id = 1
-
-    for y in range(h):
-        for x in range(w):
-            if not fg[y, x] or visited[y, x]:
-                continue
-
-            stack = [(y, x)]
-            visited[y, x] = True
-            while stack:
-                cy, cx = stack.pop()
-                merged[cy, cx] = current_id
-                for ny in range(max(0, cy - 1), min(h, cy + 2)):
-                    for nx in range(max(0, cx - 1), min(w, cx + 2)):
-                        if fg[ny, nx] and not visited[ny, nx]:
-                            visited[ny, nx] = True
-                            stack.append((ny, nx))
-            current_id += 1
-
-    return merged
-
-
-def _download_result_tiles(job: openeo.BatchJob, output_dir: Path | str) -> list[Path]:
-    """Download all GTiff outputs from a batch job."""
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        job.download_results(str(out_dir))
-    except TypeError:
-        job.download_results(output_dir=str(out_dir))
-
-    tif_files = sorted(out_dir.glob("*.tif")) + sorted(out_dir.glob("*.tiff"))
-    tif_files = sorted({p.resolve() for p in tif_files})
-    if not tif_files:
-        raise FileNotFoundError(f"No GeoTIFF outputs found in {out_dir}")
-    return tif_files
-
-
-def _mosaic_result_tiles(tif_files: list[Path]) -> np.ndarray:
-    """Mosaic multiple result tiles into one array if the job produced several files."""
-    if len(tif_files) == 1:
-        return _load_instance_raster(tif_files[0])
-
-    datasets = [rasterio.open(p) for p in tif_files]
-    try:
-        if merge_rasters is None:
-            raise RuntimeError("rasterio.merge is unavailable")
-        mosaic, _ = merge_rasters(datasets, nodata=0)
-    finally:
-        for ds in datasets:
-            ds.close()
-
-    if mosaic.ndim == 3:
-        mosaic = mosaic[0] if mosaic.shape[0] == 1 else mosaic.transpose(1, 2, 0)
-    arr = np.asarray(mosaic)
-    if arr.ndim == 3:
-        arr = arr[:, :, 0]
-    return arr.astype(np.int32, copy=False)
-
-
-def _visualize_instance_map(label_map: np.ndarray, title: str, save_path: Path | str) -> None:
-    """Create a simple overlay plot of the final merged instances."""
-    save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(10, 10))
-    masked = np.ma.masked_where(label_map == 0, label_map)
-    ax.imshow(masked, cmap="tab20", interpolation="nearest")
-    ax.set_title(title)
-    ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _download_and_visualize_batch_result(job: openeo.BatchJob, output_dir: Path | str) -> np.ndarray:
-    """Download a batch result, recombine chunk-local labels, and save a preview plot."""
-    output_dir = Path(output_dir)
-    tile_paths = _download_result_tiles(job, output_dir)
-    raw_labels = _mosaic_result_tiles(tile_paths)
-    merged_labels = _recombine_chunked_instances(raw_labels)
-
-    preview_path = output_dir / "merged_instances_preview.png"
-    _visualize_instance_map(merged_labels, "Merged chunked instance labels", preview_path)
-
-    print(f"Downloaded result files: {[p.name for p in tile_paths]}")
-    print(f"Raw label stats: min={raw_labels.min() if raw_labels.size else 0}, max={raw_labels.max() if raw_labels.size else 0}")
-    print(f"Merged label stats: min={merged_labels.min() if merged_labels.size else 0}, max={merged_labels.max() if merged_labels.size else 0}")
-    print(f"Saved merged preview: {preview_path}")
-    return merged_labels
 
 
 def main() -> None:
     backend = "https://openeo.dataspace.copernicus.eu"
-    output_path = "delineate_fields.tif"
     weights_url = DEFAULT_WEIGHTS_URL
     result_dir = Path("delineate_fields_result")
 
     conn = openeo.connect(backend)
     conn.authenticate_oidc()
 
+    # Palouse (SE Washington, USA), ~10 km x 10 km around rolling croplands.
     geometry = {
         "type": "Polygon",
         "coordinates": [[
-            [4.997886465978867, 51.000003053347534],
-            [5.0500127304842835, 50.99909971909893],
-            [5.052258312621218, 51.04996441050298],
-            [5.000075043015026, 51.05086937572316],
-            [4.997886465978867, 51.000003053347534],
+            [-117.0635, 46.7150],
+            [-116.9325, 46.7150],
+            [-116.9325, 46.8050],
+            [-117.0635, 46.8050],
+            [-117.0635, 46.7150],
         ]],
     }
+    
 
     cube = build_delineate_onnx(
         connection=conn,
@@ -378,22 +239,48 @@ def main() -> None:
         weights_url=weights_url,
     )
 
-    job = cube.execute_batch(
-        outputfile=output_path,
-        out_format="GTiff",
-        title="Delineate-Anything demo (PyTorch UDF)",
+    job = cube.create_job(
+        out_format="GeoJSON",
+        title="Delineate-Anything demo (Palouse 10x10 km)",
         job_options=DEFAULT_JOB_OPTIONS,
     )
-    print(f"Submitted job {job.job_id}")
-    print("Waiting for job completion...")
-    job.get_results()
+    job.start_and_wait()
+    job.get_results().download_files(result_dir)
+    print(f"Job {job.job_id} results in {result_dir}")
 
-    merged_labels = _download_and_visualize_batch_result(job, result_dir)
-    print(f"Downloaded merged instance map with {int(merged_labels.max())} objects.")
 
+#%%
+def plot_vectorcube_geojson(result_dir: Path) -> None:
+    """Plot the downloaded vectorcube GeoJSON with field_id labels."""
+    import geopandas as gpd
+    import matplotlib.pyplot as plt
+
+    vector_path = result_dir / "vectorcube.geojson"
+    if not vector_path.exists():
+        print(f"No vectorcube result found at: {vector_path}")
+        return
+
+    fields = gpd.read_file(vector_path)
+    if fields.empty:
+        print(f"Vector cube is empty: {vector_path}")
+        return
+
+    column = "field_id" if "field_id" in fields.columns else "band0"
+    ax = fields.plot(
+        column=column,
+        cmap="viridis",
+        edgecolor="black",
+        linewidth=0.2,
+        figsize=(10, 10),
+    )
+    for fid, pt in zip(fields[column], fields.representative_point()):
+        ax.annotate(str(fid), (pt.x, pt.y), ha="center", va="center", fontsize=4)
+    ax.set_title(f"{len(fields)} fields ({column})")
+    ax.set_axis_off()
+    plt.show()
 
 if __name__ == "__main__":
     main()
+    plot_vectorcube_geojson(Path("delineate_fields_result"))
 
-#%%
-
+# %%

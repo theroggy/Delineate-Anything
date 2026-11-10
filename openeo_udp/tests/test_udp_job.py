@@ -39,6 +39,7 @@ def submit_udp_job(
     )
     return cube.create_job(
         title=title,
+        out_format="GeoJSON",
         job_options=job_options or DEFAULT_JOB_OPTIONS,
     )
 
@@ -71,3 +72,11 @@ if __name__ == "__main__":
     main()
 
 # %%
+
+
+connection = openeo.connect("https://openeo.dataspace.copernicus.eu").authenticate_oidc()
+job = connection.job("j-26091714120441c7aa6b649d8621fbe3")
+
+results = job.get_results()
+files = results.download_files()
+
